@@ -16,7 +16,7 @@ from pathlib import Path
 
 from docx.opc.exceptions import PackageNotFoundError
 
-from articles import extract_docx_article, extract_docx_images, list_docx
+from articles import extract_docx_article, extract_docx_images, list_docx, normalize_article_title
 from cookies import load_cookie_file
 from browser_publish import publish_draft
 from publish_monitor import PublishMonitor

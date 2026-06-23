@@ -32,11 +32,34 @@ def visible_len(text: str) -> int:
     return len(text.strip())
 
 
+
+
+TITLE_PREFIX_RE = re.compile(
+    r"^((?:\d{6,}|\d{4}[-_]?\d{2}[-_]?\d{2}[-_]?\d{0,6})(?:__|[_\-\s]+)|(?:[A-Za-z0-9]+__)+|(?:[^_\\/]{1,30}__)+|(?:\d+[._、\-\s]+))+"
+)
+
+
+def normalize_article_title(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("　", " ")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    text = TITLE_PREFIX_RE.sub("", text)
+    parts = text.split("__")
+    if len(parts) >= 4 and re.fullmatch(r"\d{8}_\d{6}_\d+", parts[0] or ""):
+        text = parts[-1]
+    elif len(parts) >= 3 and parts[0].isdigit():
+        text = parts[-1]
+    text = re.sub(r"^[A-Za-z0-9_-]{1,32}__", "", text)
+    text = re.sub(r"^\d+[._、\-\s]+", "", text)
+    text = re.sub(r"[\x00-\x1f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip(" _-，。；：、【】[]()（）《》<>") or str(value or "").strip()
+
+
 def clean_processing_stem(stem: str) -> str:
-    parts = stem.split("__")
-    if len(parts) >= 4 and parts[0].isdigit():
-        return parts[-1].strip("_ ") or stem
-    return stem
+    return normalize_article_title(stem)
 
 
 def sanitize_filename_stem(text: str, max_chars: int) -> str:

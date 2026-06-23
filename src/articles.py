@@ -8,8 +8,34 @@ from pathlib import Path
 from typing import List
 from zipfile import ZipFile
 import shutil
+import re
 
 from docx import Document
+import re
+
+
+TITLE_PREFIX_RE = re.compile(
+    r"^((?:\d{6,}|\d{4}[-_]?\d{2}[-_]?\d{2}[-_]?\d{0,6})(?:__|[_\-\s]+)|(?:[A-Za-z0-9]+__)+|(?:[^_\\/]{1,30}__)+|(?:\d+[._、\-\s]+))+"
+)
+
+
+def normalize_article_title(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("　", " ")
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    text = TITLE_PREFIX_RE.sub("", text)
+    parts = text.split("__")
+    if len(parts) >= 4 and re.fullmatch(r"\d{8}_\d{6}_\d+", parts[0] or ""):
+        text = parts[-1]
+    elif len(parts) >= 3 and parts[0].isdigit():
+        text = parts[-1]
+    text = re.sub(r"^[A-Za-z0-9_-]{1,32}__", "", text)
+    text = re.sub(r"^\d+[._、\-\s]+", "", text)
+    text = re.sub(r"[\x00-\x1f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip(" _-，。；：、【】[]()（）《》<>") or str(value or "").strip()
 
 
 @dataclass
@@ -64,20 +90,12 @@ def _docx_image_relmap(doc: Document, path: Path) -> dict[str, str]:
     return relmap
 
 
-def _clean_processing_stem(stem: str) -> str:
-    # Processing files are renamed like: 20260621_111204_233860__??8__15936_xxx__Original_Title
-    # Never use the timestamp/worker prefix as the article title.
-    parts = stem.split("__")
-    if len(parts) >= 4 and parts[0].isdigit():
-        return parts[-1].strip("_ ") or stem
-    return stem
-
-
 def extract_docx_article(path: Path) -> Article:
     doc = Document(str(path))
-    paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+    paras = [normalize_article_title(p.text) for p in doc.paragraphs if p.text and p.text.strip()]
+    paras = [p for p in paras if p]
     # Prefer the first non-empty paragraph as title; if unavailable, strip processing prefixes from filename.
-    title = paras[0] if paras else _clean_processing_stem(path.stem)
+    title = paras[0] if paras else normalize_article_title(path.stem)
     body_paras = paras[1:] if len(paras) > 1 else []
     body = "\n\n".join(body_paras or paras)
     relmap = _docx_image_relmap(doc, path)
