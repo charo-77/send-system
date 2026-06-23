@@ -12,6 +12,7 @@ POOL_PROCESSING_DIR = '处理中'
 LEDGER_NAME = 'A发布记录.jsonl'
 STATUS_FILE = '.worker_status.json'
 LAST_RUN_FILE = '.last_run.json'
+CONTROL_FILE_NAME = '.publish_control.json'
 
 
 def now_str() -> str:
@@ -63,6 +64,9 @@ def build_monitor(root: Path, out_dir: Path) -> dict[str, Any]:
         last_run = load_json(root / LAST_RUN_FILE) or {}
     last_run_accounts = [str(x).strip() for x in (last_run.get('accounts') or []) if str(x).strip()]
     per_account_count = int(last_run.get('per_account_count') or 0)
+    control = load_json(out_dir / CONTROL_FILE_NAME) or {}
+    control_mode = str(control.get('mode') or 'running')
+    shortage_notice = out_dir / '文章不足提醒.txt'
     last_run_time = str(last_run.get('time') or '').strip()
     run_started_at = None
     if last_run_time:
@@ -173,6 +177,13 @@ def build_monitor(root: Path, out_dir: Path) -> dict[str, Any]:
                 planned_total = max(success_cnt + failed_cnt + int(agg.get('processing', 0) or 0), 1)
             published = success_cnt
 
+        if current_state == 'article_insufficient':
+            status_text = '文章不足'
+        elif current_state in {'paused', 'pause'}:
+            status_text = '已暂停'
+        elif current_state in {'stopped', 'stop_after_current'}:
+            status_text = '停止中'
+
         windows[f'窗口{idx}'] = {
             '账号': worker,
             '状态': status_text,
@@ -190,16 +201,32 @@ def build_monitor(root: Path, out_dir: Path) -> dict[str, Any]:
             '失败原因': str(failure_row.get('failure_reason') or ''),
         }
 
+    shortage_text = ''
+    if shortage_notice.exists():
+        try:
+            shortage_text = shortage_notice.read_text(encoding='utf-8').strip()
+        except Exception:
+            shortage_text = ''
+
     if last_run_accounts:
         run_success_total = sum(int(by_worker.get(w, {}).get('run_success', 0) or 0) for w in last_run_accounts)
         run_failed_total = sum(int(by_worker.get(w, {}).get('run_failed', 0) or 0) for w in last_run_accounts)
         overall = f'运行中 · 活跃{active_count} · 本轮成功{run_success_total} · 本轮失败{run_failed_total}' if active_count else f'已结束 · 本轮成功{run_success_total} · 本轮失败{run_failed_total}'
     else:
         overall = f'运行中 · 活跃{active_count} · 成功{success_total} · 失败{failed_total}' if active_count else f'已结束 · 成功{success_total} · 失败{failed_total}'
+    if control_mode in {'pause', 'paused'}:
+        overall = '已暂停 · ' + overall
+    elif control_mode in {'stop', 'stop_after_current', 'stopping'}:
+        overall = '停止中 · ' + overall
+    if shortage_text:
+        overall = '文章不足 · ' + overall
+
     return {
         '项目': '百家号发布池监控',
         '更新时间': now_str(),
         '总体状态': overall,
+        '控制状态': control_mode,
+        '文章不足提醒': shortage_text,
         '窗口': windows,
     }
 

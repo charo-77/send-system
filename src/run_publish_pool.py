@@ -12,6 +12,7 @@ import os
 POOL_STATUS_FILE = '.worker_status.json'
 MONITOR_DIR_NAME = '发布监控'
 LAST_ACTIVITY_FILE = '.last_activity_name.txt'
+CONTROL_FILE_NAME = '.publish_control.json'
 
 from account_manager_config import load_worker_configs_from_any
 
@@ -204,6 +205,13 @@ def make_monitor_run_dir(root: Path) -> Path:
         n += 1
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def write_control_state(monitor_dir: Path, mode: str = 'running') -> Path:
+    path = monitor_dir / CONTROL_FILE_NAME
+    payload = {'mode': mode, 'updated_at': datetime.now().astimezone().isoformat(timespec='seconds')}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return path
 
 
 def write_last_run(root: Path, monitor_dir: Path, requested_accounts: list[str], per_account_count: int, launch_plan: list[dict]) -> Path:
@@ -485,6 +493,7 @@ def main() -> int:
             'command': cmd,
         })
 
+    article_shortage = total_todo_after < need_total
     summary = {
         "root": str(root),
         "publish_mode": args.publish_mode,
@@ -497,6 +506,8 @@ def main() -> int:
         "root_docx_before": root_docx_before,
         "todo_before": total_todo_before,
         "todo_after": total_todo_after,
+        "article_shortage": article_shortage,
+        "shortage_count": max(0, need_total - total_todo_after),
         "ingested_total": total_ingested,
         "worker_targets": [
             {"worker": x['worker'], "group": getattr(x['config'], 'group_name', '') or '', "root": str(x['root'])}
@@ -515,6 +526,10 @@ def main() -> int:
         return 0
 
     write_last_run(root, monitor_dir, requested_accounts, args.count, launch_plan)
+    write_control_state(monitor_dir, 'running')
+    if article_shortage:
+        shortage_path = monitor_dir / '文章不足提醒.txt'
+        shortage_path.write_text(f'计划发布 {need_total} 篇，当前待发布 {total_todo_after} 篇，缺少 {max(0, need_total - total_todo_after)} 篇。\n', encoding='utf-8')
     start_monitor_process(root, monitor_dir)
 
     limit = max(1, int(args.concurrency or 0)) if int(args.concurrency or 0) > 0 else len(launch_plan)

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QLabel, QMainWindow,
+    QApplication, QFrame, QLabel, QMainWindow, QPushButton,
     QScrollArea, QVBoxLayout, QWidget, QHBoxLayout
 )
 
@@ -36,6 +36,8 @@ QLabel#sub {{ color: {C.YELLOW}; font-size: 8.5pt; background: transparent; }}
 QFrame#row_card {{ background-color: white; border: 1px solid {C.BORDER}; border-radius: 6px; min-height: 34px; max-height: 34px; }}
 QLabel#line {{ color: {C.FG_BRIGHT}; font-size: 8.5pt; background: transparent; }}
 QLabel#status {{ color: white; font-size: 8.5pt; font-weight: bold; border-radius: 9px; padding: 3px 8px; min-width: 92px; max-width: 92px; }}
+QPushButton {{ background-color: white; color: #4A2C0A; border: 1px solid #FFC72C; border-radius: 6px; padding: 5px 10px; font-weight: bold; }}
+QPushButton:hover {{ background-color: #FFC72C; }}
 QScrollArea {{ border: none; background: transparent; }}
 """
 
@@ -56,6 +58,12 @@ def short_status(item: dict) -> str:
     reason = str(item.get('失败原因', '') or item.get('说明', '') or '')
     if '成功' in status:
         return '发布成功'
+    if '不足' in status or '不足' in reason or 'article_insufficient' in reason:
+        return '文章不足'
+    if '暂停' in status:
+        return '已暂停'
+    if '停止' in status:
+        return '停止中'
     if '失败' in status:
         if 'article' in reason.lower() or '不足' in reason:
             return '文章不足'
@@ -131,9 +139,21 @@ class MonitorWindow(QMainWindow):
         sub.setObjectName('sub')
         self.summary = QLabel('运行中')
         self.summary.setStyleSheet('color:white; font-weight:bold; background:transparent;')
+        buttons = QHBoxLayout()
+        self.pause_btn = QPushButton('暂停发布')
+        self.resume_btn = QPushButton('继续发布')
+        self.stop_btn = QPushButton('停止发布')
+        self.pause_btn.clicked.connect(lambda: self._write_control('pause'))
+        self.resume_btn.clicked.connect(lambda: self._write_control('running'))
+        self.stop_btn.clicked.connect(lambda: self._write_control('stop_after_current'))
+        buttons.addWidget(self.pause_btn)
+        buttons.addWidget(self.resume_btn)
+        buttons.addWidget(self.stop_btn)
+        buttons.addStretch()
         hh.addWidget(title)
         hh.addWidget(sub)
         hh.addWidget(self.summary)
+        hh.addLayout(buttons)
         root.addWidget(header)
 
         scroll = QScrollArea()
@@ -150,6 +170,14 @@ class MonitorWindow(QMainWindow):
         self.timer.setInterval(1200)
         self.timer.timeout.connect(self.refresh)
         self.timer.start()
+        self.refresh()
+
+    def _control_path(self) -> Path:
+        return self.monitor_path.parent / '.publish_control.json'
+
+    def _write_control(self, mode: str):
+        payload = {'mode': mode}
+        self._control_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
         self.refresh()
 
     def _load_data(self) -> dict:

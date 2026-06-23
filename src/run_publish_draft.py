@@ -61,6 +61,39 @@ POOL_FAILED_DIR = "A发布失败"
 LEDGER_NAME = "A发布记录.jsonl"
 MAX_PROCESSING_PATH_LEN = 220
 
+CONTROL_FILE_NAME = ".publish_control.json"
+
+
+def _control_path(root_dir: Path) -> Path:
+    return root_dir / "发布监控" / CONTROL_FILE_NAME
+
+
+def _load_control(root_dir: Path) -> dict:
+    path = _control_path(root_dir)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _control_mode(root_dir: Path) -> str:
+    return str(_load_control(root_dir).get("mode") or "running").strip().lower()
+
+
+async def _wait_if_paused(root_dir: Path, monitor: PublishMonitor, slot: int, worker: str) -> bool:
+    while True:
+        mode = _control_mode(root_dir)
+        if mode in {"stop", "stop_after_current", "stopping"}:
+            monitor.update_slot(slot, cn_state("FAILED"), 账号=worker, 说明="收到停止发布指令，不再领取新文章", 失败分类="stopped_by_user")
+            return False
+        if mode not in {"pause", "paused"}:
+            return True
+        monitor.update_slot(slot, "已暂停", 账号=worker, 说明="暂停发布中，再点继续后恢复领取下一篇")
+        await asyncio.sleep(2)
+
 
 def _pool_todo_dir(root: Path) -> Path:
     return root / POOL_TODO_DIR
@@ -93,13 +126,22 @@ def _list_todo_docx(root: Path) -> list[Path]:
 
 
 def _make_processing_docx_name(src: Path, worker: str) -> str:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_worker = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", worker or "worker").strip("_") or "worker"
-    unique = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    base_title = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", src.stem).strip("_") or "doc"
-    base_title = base_title[:40]
-    return f"{stamp}__{safe_worker}__{unique}__{base_title}{src.suffix}"
+    base_title = _clean_article_title(src.stem) or "doc"
+    return f"{safe_worker}__{base_title}{src.suffix}"
 
+
+def _clean_article_title(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^(?:\d{6,}|\d{4}[-_]?\d{2}[-_]?\d{2}[-_]?\d{0,6})(?:__|[_\-\s]+)", "", text)
+    parts = text.split("__")
+    if len(parts) >= 4 and re.fullmatch(r"\d{8}_\d{6}_\d+", parts[0] or ""):
+        text = parts[-1]
+    elif len(parts) >= 3 and parts[0].isdigit():
+        text = parts[-1]
+    text = re.sub(r"^[^_\\/]{1,30}__", "", text)
+    text = re.sub(r"^\d+[._、\-\s]+", "", text)
+    return text.strip(" _-，。；：、") or str(value or "").strip()
 
 def _try_acquire_claim_lock(src: Path, worker: str) -> Path | None:
     # Use an ASCII hash lock name instead of appending to the Chinese/original docx filename.
@@ -781,66 +823,72 @@ async def main() -> int:
     todo_now = _list_todo_docx(articles_root)
     total_count = planned or len(todo_now)
 
-    claimed_files: list[tuple[Path, dict]] = []
-    if args.all:
-        empty_claim_retries = 6
-        empty_claim_sleep_seconds = 2
-        empty_claim_attempts = 0
-        while True:
-            if planned is not None and len(claimed_files) >= planned:
-                break
-            claimed, claim_info = _claim_next_docx(articles_root, worker)
-            if not claimed:
-                empty_claim_attempts += 1
-                if planned is not None and len(claimed_files) > 0:
-                    break
-                if empty_claim_attempts >= empty_claim_retries:
-                    break
-                time.sleep(empty_claim_sleep_seconds)
-                continue
-            empty_claim_attempts = 0
-            claimed_files.append((claimed, claim_info or {}))
-    else:
-        all_todo = _list_todo_docx(articles_root)
-        if not all_todo:
-            raise SystemExit("待发布目录中没有 docx")
-        if args.index < 0 or args.index >= len(all_todo):
-            raise SystemExit(f"index out of range: {args.index}; total={len(all_todo)}")
-        chosen = all_todo[args.index]
-        candidate_claims = []
-        for idx2, src in enumerate(all_todo):
-            info = {"chosen": idx2 == args.index, "from": str(src)}
-            candidate_claims.append(info)
-        desired = _pool_processing_dir(articles_root, worker) / chosen.name
-        if desired.exists():
-            raise SystemExit(f"抢单失败: processing destination already exists: {desired}")
-        try:
-            desired.parent.mkdir(parents=True, exist_ok=True)
-            chosen.replace(desired)
-            claimed_files.append((desired, {"ok": True, "from": str(chosen), "to": str(desired), "worker": worker, "indexed_claim": True}))
-        except FileNotFoundError:
-            raise SystemExit("抢单失败: 目标文件已被其他 worker 抢走")
-        except Exception as e:
-            raise SystemExit(f"抢单失败: {e}")
-
-    if not claimed_files:
-        raise SystemExit("待发布目录中没有可抢占的 docx")
+    claim_plan_total = int(planned or len(todo_now) or 0)
+    if claim_plan_total <= 0:
+        monitor.update_slot(args.monitor_slot, "文章不足", 账号=worker, 总共=0, 已发布=0, 说明="待发布目录中没有可抢占的 docx")
+        _write_worker_status(articles_root, worker, {
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "worker": worker,
+            "state": "article_insufficient",
+            "planned_total": 0,
+            "debug_root": str(debug_root),
+            "worker_config": (worker_config.to_public_dict() if worker_config else None),
+        })
+        return 0
 
     _write_worker_status(articles_root, worker, {
         "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "worker": worker,
-        "state": "claimed",
-        "planned_total": len(claimed_files),
+        "state": "waiting_claim",
+        "planned_total": claim_plan_total,
         "debug_root": str(debug_root),
         "worker_config": (worker_config.to_public_dict() if worker_config else None),
     })
 
-    for idx, (docx_path, claim_info) in enumerate(claimed_files, start=1):
-        slot = args.monitor_slot + idx - 1
+    idx = 0
+    while idx < claim_plan_total:
+        slot = args.monitor_slot
+        if not await _wait_if_paused(articles_root, monitor, slot, worker):
+            break
+        if args.all:
+            claimed, claim_info = _claim_next_docx(articles_root, worker)
+            if not claimed:
+                monitor.update_slot(slot, "文章不足", 账号=worker, 总共=claim_plan_total, 已发布=published_count, 说明="待发布池已空，不再新开窗口")
+                _write_worker_status(articles_root, worker, {
+                    "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "worker": worker,
+                    "state": "article_insufficient",
+                    "published": published_count,
+                    "planned_total": claim_plan_total,
+                    "debug_root": str(debug_root),
+                    "worker_config": (worker_config.to_public_dict() if worker_config else None),
+                })
+                break
+            docx_path, claim_info = claimed, claim_info or {}
+        else:
+            all_todo = _list_todo_docx(articles_root)
+            if not all_todo:
+                raise SystemExit("待发布目录中没有 docx")
+            if args.index < 0 or args.index >= len(all_todo):
+                raise SystemExit(f"index out of range: {args.index}; total={len(all_todo)}")
+            chosen = all_todo[args.index]
+            desired = _pool_processing_dir(articles_root, worker) / _make_processing_docx_name(chosen, worker)
+            if desired.exists():
+                raise SystemExit(f"抢单失败: processing destination already exists: {desired}")
+            try:
+                desired.parent.mkdir(parents=True, exist_ok=True)
+                chosen.replace(desired)
+                docx_path, claim_info = desired, {"ok": True, "from": str(chosen), "to": str(desired), "worker": worker, "indexed_claim": True, "original_name": chosen.name}
+            except FileNotFoundError:
+                raise SystemExit("抢单失败: 目标文件已被其他 worker 抢走")
+            except Exception as e:
+                raise SystemExit(f"抢单失败: {e}")
+        idx += 1
+        slot = args.monitor_slot
         final_summary = None
         ok = False
         original_name = str((claim_info or {}).get("original_name") or "").strip()
-        article_title = Path(original_name).stem if original_name else docx_path.stem
+        article_title = _clean_article_title(Path(original_name).stem if original_name else docx_path.stem)
 
         fallback_paths = [str((claim_info or {}).get("from") or ""), str((claim_info or {}).get("to") or "")]
 
@@ -879,14 +927,14 @@ async def main() -> int:
                 封面模式="",
                 活动状态="",
                 活动名称="",
-                总共=total_count,
+                总共=claim_plan_total,
                 已发布=published_count,
                 失败分类="path_too_long",
                 失败原因=structured.get("failure_reason", ""),
                 尝试次数=f"1/{args.max_retries + 1}",
             )
             _write_running_results(debug_root, results)
-            report = _summarize_batch_results(results, total_count=total_count, max_retries=args.max_retries, mode="batch" if args.all else "single")
+            report = _summarize_batch_results(results, total_count=claim_plan_total, max_retries=args.max_retries, mode="batch" if args.all else "single")
             _write_batch_report(debug_root, report)
             continue
 
@@ -931,14 +979,14 @@ async def main() -> int:
                 封面模式="",
                 活动状态="",
                 活动名称="",
-                总共=total_count,
+                总共=claim_plan_total,
                 已发布=published_count,
                 失败分类="claimed_docx_missing",
                 失败原因=structured.get("failure_reason", ""),
                 尝试次数=f"1/{args.max_retries + 1}",
             )
             _write_running_results(debug_root, results)
-            report = _summarize_batch_results(results, total_count=total_count, max_retries=args.max_retries, mode="batch" if args.all else "single")
+            report = _summarize_batch_results(results, total_count=claim_plan_total, max_retries=args.max_retries, mode="batch" if args.all else "single")
             _write_batch_report(debug_root, report)
             continue
 
@@ -985,14 +1033,14 @@ async def main() -> int:
                 封面模式="",
                 活动状态="",
                 活动名称="",
-                总共=total_count,
+                总共=claim_plan_total,
                 已发布=published_count,
                 失败分类="docx_open_failed",
                 失败原因=structured.get("failure_reason", ""),
                 尝试次数=f"1/{args.max_retries + 1}",
             )
             _write_running_results(debug_root, results)
-            report = _summarize_batch_results(results, total_count=total_count, max_retries=args.max_retries, mode="batch" if args.all else "single")
+            report = _summarize_batch_results(results, total_count=claim_plan_total, max_retries=args.max_retries, mode="batch" if args.all else "single")
             _write_batch_report(debug_root, report)
             continue
         except Exception as e:
@@ -1036,14 +1084,14 @@ async def main() -> int:
                 封面模式="",
                 活动状态="",
                 活动名称="",
-                总共=total_count,
+                总共=claim_plan_total,
                 已发布=published_count,
                 失败分类="docx_read_failed",
                 失败原因=structured.get("failure_reason", ""),
                 尝试次数=f"1/{args.max_retries + 1}",
             )
             _write_running_results(debug_root, results)
-            report = _summarize_batch_results(results, total_count=total_count, max_retries=args.max_retries, mode="batch" if args.all else "single")
+            report = _summarize_batch_results(results, total_count=claim_plan_total, max_retries=args.max_retries, mode="batch" if args.all else "single")
             _write_batch_report(debug_root, report)
             continue
 
@@ -1054,7 +1102,7 @@ async def main() -> int:
             "current_docx": str(docx_path),
             "current_title": article.title,
             "run_index": idx,
-            "planned_total": len(claimed_files),
+            "planned_total": claim_plan_total,
             "debug_root": str(debug_root),
             "worker_config": (worker_config.to_public_dict() if worker_config else None),
         })
@@ -1073,7 +1121,7 @@ async def main() -> int:
         for attempt_no in range(1, args.max_retries + 2):
             per_debug_dir = debug_root / f"run_{idx:02d}_try_{attempt_no:02d}_{docx_path.stem}"
             per_debug_dir.mkdir(parents=True, exist_ok=True)
-            profile_dir = Path(args.profile) if args.profile else (debug_root / "profiles" / f"slot_{idx:02d}_try_{attempt_no:02d}")
+            profile_dir = Path(args.profile) if args.profile else (debug_root / "profiles" / f"worker_{worker}")
             profile_dir.mkdir(parents=True, exist_ok=True)
             try:
                 final_summary, ok = await publish_one(
@@ -1084,14 +1132,14 @@ async def main() -> int:
                     profile_dir=profile_dir,
                     debug_dir=per_debug_dir,
                     cookies=cookies,
-                    total_count=total_count,
+                    total_count=claim_plan_total,
                     published_so_far=published_count,
                     attempt_no=attempt_no,
                     max_retries=args.max_retries,
                 )
                 print(json.dumps(final_summary, ensure_ascii=False, indent=2))
             finally:
-                if not args.keep_profile and not args.profile:
+                if False and not args.keep_profile and not args.profile:
                     shutil.rmtree(profile_dir, ignore_errors=True)
 
             if ok:
@@ -1111,7 +1159,7 @@ async def main() -> int:
                 封面模式=((final_summary or {}).get("structured_result") or {}).get("cover_mode", ""),
                 活动状态=((final_summary or {}).get("structured_result") or {}).get("activity_status", ""),
                 活动名称=((final_summary or {}).get("structured_result") or {}).get("activity_name", ""),
-                总共=total_count,
+                总共=claim_plan_total,
                 已发布=published_count,
                 失败分类=failure_code,
                 失败原因=((final_summary or {}).get("structured_result") or {}).get("failure_reason", ""),
@@ -1143,7 +1191,7 @@ async def main() -> int:
                 封面模式=structured.get("cover_mode", ""),
                 活动状态=structured.get("activity_status", ""),
                 活动名称=structured.get("activity_name", ""),
-                总共=total_count,
+                总共=claim_plan_total,
                 已发布=published_count,
                 失败分类=structured.get("failure_code", "wrong_entry"),
                 失败原因=structured.get("failure_reason", ""),
@@ -1171,11 +1219,11 @@ async def main() -> int:
             "account_online_status": structured.get("account_online_status", ""),
         })
         _write_running_results(debug_root, results)
-        report = _summarize_batch_results(results, total_count=total_count, max_retries=args.max_retries, mode="batch" if args.all else "single")
+        report = _summarize_batch_results(results, total_count=claim_plan_total, max_retries=args.max_retries, mode="batch" if args.all else "single")
         _write_batch_report(debug_root, report)
         if ok:
             published_count += 1
-            if args.success_interval_seconds > 0 and idx < len(claimed_files):
+            if args.success_interval_seconds > 0 and idx < claim_plan_total:
                 monitor.update_slot(
                     slot,
                     cn_state("SUCCESS"),
@@ -1186,13 +1234,13 @@ async def main() -> int:
                     封面模式=structured.get("cover_mode", ""),
                     活动状态=structured.get("activity_status", ""),
                     活动名称=structured.get("activity_name", ""),
-                    总共=total_count,
+                    总共=claim_plan_total,
                     已发布=published_count,
                     说明=f"发布成功，等待 {args.success_interval_seconds} 秒后继续下一篇",
                 )
                 await asyncio.sleep(max(0, args.success_interval_seconds))
 
-    batch_summary = _summarize_batch_results(results, total_count=total_count, max_retries=args.max_retries, mode="batch" if args.all else "single")
+    batch_summary = _summarize_batch_results(results, total_count=claim_plan_total, max_retries=args.max_retries, mode="batch" if args.all else "single")
     _write_running_results(debug_root, results, batch_summary=batch_summary)
     _write_batch_report(debug_root, batch_summary)
     _write_worker_status(articles_root, worker, {
@@ -1206,7 +1254,7 @@ async def main() -> int:
         "worker_config": (worker_config.to_public_dict() if worker_config else None),
     })
     _clear_worker_status(articles_root, worker)
-    monitor.finish(summary_text=f"batch={batch_summary['mode']} | published={batch_summary['published']}/{total_count} | retries={args.max_retries}")
+    monitor.finish(summary_text=f"batch={batch_summary['mode']} | published={batch_summary['published']}/{claim_plan_total} | retries={args.max_retries}")
     print(json.dumps(batch_summary, ensure_ascii=False, indent=2))
     return 0
 
