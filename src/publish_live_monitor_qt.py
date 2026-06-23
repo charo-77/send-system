@@ -178,6 +178,12 @@ class MonitorWindow(QMainWindow):
     def _write_control(self, mode: str):
         payload = {'mode': mode}
         self._control_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        data = self._load_data()
+        root_text = str(data.get('发布根目录') or data.get('root') or data.get('Root') or '').strip()
+        if root_text:
+            root_control = Path(root_text) / '发布监控' / '.publish_control.json'
+            root_control.parent.mkdir(parents=True, exist_ok=True)
+            root_control.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
         self.refresh()
 
     def _load_data(self) -> dict:

@@ -207,10 +207,27 @@ def make_monitor_run_dir(root: Path) -> Path:
     return run_dir
 
 
-def write_control_state(monitor_dir: Path, mode: str = 'running') -> Path:
-    path = monitor_dir / CONTROL_FILE_NAME
+
+def _account_fingerprint_map(accounts: list[str], configs: list) -> dict[str, str]:
+    by_name = {}
+    for cfg in configs:
+        name = str(getattr(cfg, 'worker_name', '') or getattr(cfg, 'account_name', '') or '').strip()
+        if not name:
+            continue
+        fp = str(getattr(cfg, 'fingerprint_profile', '') or getattr(cfg, 'fingerprint_id', '') or '').strip()
+        if fp:
+            by_name[name] = fp
+    return {name: by_name.get(name, '') for name in accounts}
+
+
+def write_control_state(monitor_dir: Path, mode: str = 'running', root: Path | None = None) -> Path:
     payload = {'mode': mode, 'updated_at': datetime.now().astimezone().isoformat(timespec='seconds')}
+    path = monitor_dir / CONTROL_FILE_NAME
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    if root is not None:
+        root_path = root / MONITOR_DIR_NAME / CONTROL_FILE_NAME
+        root_path.parent.mkdir(parents=True, exist_ok=True)
+        root_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return path
 
 
@@ -495,18 +512,6 @@ def main() -> int:
 
     article_shortage = total_todo_after < need_total
 
-
-def _account_fingerprint_map(accounts: list[str], configs: list[WorkerConfig]) -> dict[str, str]:
-    by_name = {}
-    for cfg in configs:
-        name = str(cfg.worker_name or cfg.account_name or '').strip()
-        if not name:
-            continue
-        fp = str(getattr(cfg, 'fingerprint_profile', '') or cfg.fingerprint_id or '').strip()
-        if fp:
-            by_name[name] = fp
-    return {name: by_name.get(name, '') for name in accounts}
-
     summary = {
         "root": str(root),
         "publish_mode": args.publish_mode,
@@ -522,7 +527,7 @@ def _account_fingerprint_map(accounts: list[str], configs: list[WorkerConfig]) -
         "article_shortage": article_shortage,
         "shortage_count": max(0, need_total - total_todo_after),
         "ingested_total": total_ingested,
-        "fingerprint_map": _account_fingerprint_map(requested_accounts, worker_configs),
+        "fingerprint_map": _account_fingerprint_map(requested_accounts, all_configs),
         "worker_targets": [
             {"worker": x['worker'], "group": getattr(x['config'], 'group_name', '') or '', "root": str(x['root'])}
             for x in worker_targets
@@ -540,7 +545,7 @@ def _account_fingerprint_map(accounts: list[str], configs: list[WorkerConfig]) -
         return 0
 
     write_last_run(root, monitor_dir, requested_accounts, args.count, launch_plan)
-    write_control_state(monitor_dir, 'running')
+    write_control_state(monitor_dir, 'running', root)
     if article_shortage:
         shortage_path = monitor_dir / '文章不足提醒.txt'
         shortage_path.write_text(f'计划发布 {need_total} 篇，当前待发布 {total_todo_after} 篇，缺少 {max(0, need_total - total_todo_after)} 篇。\n', encoding='utf-8')
@@ -569,7 +574,20 @@ def _account_fingerprint_map(accounts: list[str], configs: list[WorkerConfig]) -
             'launch_plan': launch_plan,
         }, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    while pending and len(running) < limit:
+    def _read_control_mode() -> str:
+        for path in [monitor_dir / CONTROL_FILE_NAME, root / MONITOR_DIR_NAME / CONTROL_FILE_NAME]:
+            try:
+                if path.exists():
+                    data = json.loads(path.read_text(encoding='utf-8'))
+                    return str(data.get('mode') or 'running').strip().lower()
+            except Exception:
+                pass
+        return 'running'
+
+    def _can_launch_more() -> bool:
+        return _read_control_mode() not in {'stop', 'stop_after_current', 'stopping'}
+
+    while pending and len(running) < limit and _can_launch_more():
         _launch_one(pending.pop(0))
     _write_queue_state()
 
@@ -584,7 +602,7 @@ def _account_fingerprint_map(accounts: list[str], configs: list[WorkerConfig]) -
                 continue
             finished.append({"worker": meta['worker'], "pid": meta['pid'], "returncode": code})
             progressed = True
-            while pending and len(running) < limit:
+            while pending and len(running) < limit and _can_launch_more():
                 _launch_one(pending.pop(0))
         _write_queue_state()
         if not progressed:

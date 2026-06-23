@@ -224,6 +224,7 @@ def build_monitor(root: Path, out_dir: Path) -> dict[str, Any]:
     return {
         '项目': '百家号发布池监控',
         '更新时间': now_str(),
+        '发布根目录': str(root),
         '总体状态': overall,
         '控制状态': control_mode,
         '文章不足提醒': shortage_text,
