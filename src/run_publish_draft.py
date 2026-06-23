@@ -125,6 +125,30 @@ def _list_todo_docx(root: Path) -> list[Path]:
     return sorted([p for p in todo.rglob("*.docx") if p.is_file()])
 
 
+
+def _resolve_fingerprint_profile(value: str, worker: str, debug_root: Path) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    raw = Path(text).expanduser()
+    if raw.is_absolute() or any(sep in text for sep in ("/", "\\")):
+        return raw
+    safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", text).strip("_") or worker or "worker"
+    return debug_root.parent / "fingerprint_profiles" / safe
+
+
+def _worker_profile_dir(args, worker_config, worker: str, debug_root: Path) -> Path:
+    if args.profile:
+        return Path(args.profile)
+    fp_value = ""
+    if worker_config is not None:
+        fp_value = str(getattr(worker_config, "fingerprint_profile", "") or getattr(worker_config, "fingerprint_id", "") or "").strip()
+    resolved = _resolve_fingerprint_profile(fp_value, worker, debug_root)
+    if resolved is not None:
+        return resolved
+    return debug_root / "profiles" / f"worker_{worker}"
+
+
 def _make_processing_docx_name(src: Path, worker: str) -> str:
     safe_worker = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", worker or "worker").strip("_") or "worker"
     base_title = _clean_article_title(src.stem) or "doc"
@@ -1121,7 +1145,7 @@ async def main() -> int:
         for attempt_no in range(1, args.max_retries + 2):
             per_debug_dir = debug_root / f"run_{idx:02d}_try_{attempt_no:02d}_{docx_path.stem}"
             per_debug_dir.mkdir(parents=True, exist_ok=True)
-            profile_dir = Path(args.profile) if args.profile else (debug_root / "profiles" / f"worker_{worker}")
+            profile_dir = _worker_profile_dir(args, worker_config, worker, debug_root)
             profile_dir.mkdir(parents=True, exist_ok=True)
             try:
                 final_summary, ok = await publish_one(
@@ -1249,7 +1273,7 @@ async def main() -> int:
         "state": "finished",
         "published": batch_summary["published"],
         "failed": batch_summary["failed"],
-        "planned_total": total_count,
+        "planned_total": claim_plan_total,
         "debug_root": str(debug_root),
         "worker_config": (worker_config.to_public_dict() if worker_config else None),
     })

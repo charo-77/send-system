@@ -494,6 +494,19 @@ def main() -> int:
         })
 
     article_shortage = total_todo_after < need_total
+
+
+def _account_fingerprint_map(accounts: list[str], configs: list[WorkerConfig]) -> dict[str, str]:
+    by_name = {}
+    for cfg in configs:
+        name = str(cfg.worker_name or cfg.account_name or '').strip()
+        if not name:
+            continue
+        fp = str(getattr(cfg, 'fingerprint_profile', '') or cfg.fingerprint_id or '').strip()
+        if fp:
+            by_name[name] = fp
+    return {name: by_name.get(name, '') for name in accounts}
+
     summary = {
         "root": str(root),
         "publish_mode": args.publish_mode,
@@ -509,6 +522,7 @@ def main() -> int:
         "article_shortage": article_shortage,
         "shortage_count": max(0, need_total - total_todo_after),
         "ingested_total": total_ingested,
+        "fingerprint_map": _account_fingerprint_map(requested_accounts, worker_configs),
         "worker_targets": [
             {"worker": x['worker'], "group": getattr(x['config'], 'group_name', '') or '', "root": str(x['root'])}
             for x in worker_targets

@@ -517,6 +517,22 @@ class AccountManagerWindow(QMainWindow):
         save_account_records(self.accounts, self.store_path)
         self.reload_accounts()
 
+    def edit_fingerprint_profile(self):
+        records = self.selected_records()
+        if not records:
+            QMessageBox.warning(self, "提示", "先选中一个或多个账号")
+            return
+        current = records[0].fingerprint_profile or records[0].fingerprint_id or ""
+        text, ok = QInputDialog.getText(self, "设置指纹浏览器", "输入指纹浏览器路径/ID", text=current)
+        if not ok:
+            return
+        value = text.strip()
+        for item in records:
+            item.fingerprint_profile = value
+            item.fingerprint_id = value
+        save_account_records(self.accounts, self.store_path)
+        self.reload_accounts()
+
     def delete_selected_accounts(self):
         records = self.selected_records()
         if not records:
@@ -537,6 +553,7 @@ class AccountManagerWindow(QMainWindow):
         act_open = menu.addAction("打开主页")
         act_query = menu.addAction("查询")
         act_group = menu.addAction("添加分组")
+        act_fp = menu.addAction("设置指纹浏览器")
         act_delete = menu.addAction("删除")
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
         if action == act_open:
@@ -545,6 +562,8 @@ class AccountManagerWindow(QMainWindow):
             self.query_accounts()
         elif action == act_group:
             self.batch_set_group()
+        elif action == act_fp:
+            self.edit_fingerprint_profile()
         elif action == act_delete:
             self.delete_selected_accounts()
 

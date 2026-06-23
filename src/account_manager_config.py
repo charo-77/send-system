@@ -26,6 +26,7 @@ def load_worker_configs_from_any(
                 proxy_password=item.proxy_password,
                 group_name=item.group_name,
                 fingerprint_id=item.fingerprint_id,
+                fingerprint_profile=getattr(item, "fingerprint_profile", "") or item.fingerprint_id,
             )
             for item in items
         ]
@@ -47,6 +48,7 @@ def load_worker_configs_from_any(
                     proxy_password=item.proxy_password,
                     group_name=item.group_name,
                     fingerprint_id=item.fingerprint_id,
+                fingerprint_profile=getattr(item, "fingerprint_profile", "") or item.fingerprint_id,
                 )
                 for item in items
             ]

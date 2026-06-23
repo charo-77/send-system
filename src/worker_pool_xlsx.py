@@ -20,6 +20,7 @@ class WorkerConfig:
     proxy_password: str = ""
     group_name: str = ""
     fingerprint_id: str = ""
+    fingerprint_profile: str = ""
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -146,6 +147,7 @@ def load_worker_configs(path: Path, sheet_name: str | None = None) -> list[Worke
                 proxy_password=get_cell(row, '代理密码'),
                 group_name=get_cell(row, '分组'),
                 fingerprint_id=get_cell(row, '指纹ID'),
+                fingerprint_profile=get_cell(row, '指纹浏览器') or get_cell(row, '指纹路径') or get_cell(row, '指纹配置'),
             )
         )
     return configs

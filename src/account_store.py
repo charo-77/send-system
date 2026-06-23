@@ -31,6 +31,7 @@ class AccountRecord:
     proxy_username: str = ""
     proxy_password: str = ""
     fingerprint_id: str = ""
+    fingerprint_profile: str = ""
     note: str = ""
     enabled: bool = True
     source: str = "manual"
@@ -67,6 +68,7 @@ class AccountRecord:
             proxy_password=self.proxy_password,
             group_name=self.group_name,
             fingerprint_id=self.fingerprint_id,
+            fingerprint_profile=self.fingerprint_profile,
         )
 
     @classmethod
@@ -83,6 +85,7 @@ class AccountRecord:
             proxy_username=str(payload.get("proxy_username") or "").strip(),
             proxy_password=str(payload.get("proxy_password") or "").strip(),
             fingerprint_id=str(payload.get("fingerprint_id") or "").strip(),
+            fingerprint_profile=str(payload.get("fingerprint_profile") or payload.get("fingerprint_id") or "").strip(),
             note=str(payload.get("note") or "").strip(),
             enabled=bool(payload.get("enabled", True)),
             source=str(payload.get("source") or "manual").strip() or "manual",
@@ -182,6 +185,7 @@ def import_accounts_from_xlsx(xlsx_path: Path, store_path: Path | None = None, s
             proxy_username=cfg.proxy_username,
             proxy_password=cfg.proxy_password,
             fingerprint_id=cfg.fingerprint_id,
+            fingerprint_profile=cfg.fingerprint_id,
             note=previous.note if previous else "",
             enabled=previous.enabled if previous else True,
             source=f"xlsx:{Path(xlsx_path).name}",
@@ -206,6 +210,7 @@ def import_accounts_from_xlsx(xlsx_path: Path, store_path: Path | None = None, s
             previous.proxy_username = record.proxy_username
             previous.proxy_password = record.proxy_password
             previous.fingerprint_id = record.fingerprint_id
+            previous.fingerprint_profile = record.fingerprint_profile
             previous.row = record.row
             previous.source = record.source
             previous.online_status = previous.online_status or "unknown"
