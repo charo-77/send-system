@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime/debug outputs
+runtime/
+runtime_*/
+debug/
+tmp/
+*.log
+publish_results.json
+batch_report.json
+batch_report.txt
+
+# Browser profiles and login/session state
+bjh_browser_data/
+edge_profile*/
+edge_profiles*/
+
+# Local account/session/data files
+ck.txt
+*.cookies
+*.cookie
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Office/data inputs
+*.xlsx
+*.xls
+*.docx
+~$*
+
+# Images/screenshots/OCR scratch
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+screenshot_b64.txt
+
+# Node/local artifacts
+node_modules/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
