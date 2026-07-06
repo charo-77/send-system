@@ -398,7 +398,15 @@ class AccountManagerWindow(QMainWindow):
                 self.query_table.setItem(row_index, col, item)
 
     def refresh_from_state(self):
-        self.monitor_rows = apply_browser_state(self.accounts)
+        try:
+            self.monitor_rows = apply_browser_state(self.accounts)
+        except OSError as e:
+            # 磁盘满或文件写入失败时不崩溃，只跳过保存
+            self.statusBar().showMessage(f"状态刷新写入失败（磁盘空间不足？）: {e}", 5000)
+            return
+        except Exception as e:
+            self.statusBar().showMessage(f"状态刷新异常: {e}", 5000)
+            return
         self.monitor_by_worker = {row.get("worker_name") or "": row for row in self.monitor_rows}
         self.render_table()
         self.refresh_query_table()
@@ -669,9 +677,40 @@ class AccountManagerWindow(QMainWindow):
         self.settings["last_publish_mode"] = payload["publish_mode"]
         save_settings(self.settings, self.settings_path)
 
-        selected_workers = [item.worker_name for item in filtered if item.ck]
+        selected_records = [item for item in self.selected_records() if item.enabled and item.ck]
+        if selected_records:
+            publish_records = selected_records
+            source_label = "当前选中账号"
+        else:
+            publish_records = [item for item in filtered if item.ck]
+            source_label = "当前筛选结果"
+            reply = QMessageBox.question(
+                self,
+                "确认发布范围",
+                f"没有选中账号，将发布 {source_label} 里的 {len(publish_records)} 个账号。\n"
+                "如果只想发布部分账号，请先在左侧列表选中。\n\n是否继续？",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        selected_workers = [item.worker_name for item in publish_records]
         if not selected_workers:
-            QMessageBox.warning(self, "提示", "当前筛选账号都没有 CK，无法发布")
+            QMessageBox.warning(self, "提示", "当前发布范围内没有带 CK 的账号，无法发布")
+            return
+
+        requested_total = len(selected_workers) * int(payload["count"])
+        actual_concurrency = min(int(payload["concurrency"]), len(selected_workers))
+        confirm_text = (
+            f"发布范围：{source_label}\n"
+            f"账号数量：{len(selected_workers)} 个\n"
+            f"每账号条数：{payload['count']} 篇\n"
+            f"预计总任务：{requested_total} 篇\n"
+            f"请求并发：{payload['concurrency']}，实际并发：{actual_concurrency}\n"
+            f"成功间隔：{payload['success_interval_seconds']} 秒\n"
+            f"发布模式：{payload['publish_mode']}\n\n"
+            "确认开始发布？"
+        )
+        if QMessageBox.question(self, "确认发布", confirm_text) != QMessageBox.StandardButton.Yes:
             return
 
         cmd = [
@@ -695,6 +734,7 @@ class AccountManagerWindow(QMainWindow):
         if payload["activity_name"]:
             cmd += ["--activity-name", payload["activity_name"]]
         subprocess.Popen(cmd, cwd=str(REPO_ROOT))
+        self.statusBar().showMessage(f"已启动发布：{len(selected_workers)} 个账号，每账号 {payload['count']} 篇，并发 {payload['concurrency']}", 5000)
 
 
 

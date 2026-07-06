@@ -197,7 +197,7 @@ def is_busy_worker_status(status: dict | None) -> bool:
 def make_monitor_run_dir(root: Path) -> Path:
     base = root / MONITOR_DIR_NAME
     base.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime('run_%Y%m%d_%H%M%S')
+    stamp = datetime.now().strftime('%m%d%H%M')
     run_dir = base / stamp
     n = 2
     while run_dir.exists():
@@ -234,6 +234,12 @@ def write_control_state(monitor_dir: Path, mode: str = 'running', root: Path | N
 def write_last_run(root: Path, monitor_dir: Path, requested_accounts: list[str], per_account_count: int, launch_plan: list[dict]) -> Path:
     path = monitor_dir / '.last_run.json'
     run_id = monitor_dir.name
+    # 提取每个账号的实际 root（grouped 模式下各不相同）
+    worker_roots = {
+        item['worker']: str(item['root'])
+        for item in launch_plan
+        if 'worker' in item and 'root' in item
+    }
     payload = {
         'time': datetime.now().astimezone().isoformat(timespec='seconds'),
         'run_id': run_id,
@@ -242,22 +248,113 @@ def write_last_run(root: Path, monitor_dir: Path, requested_accounts: list[str],
         'accounts': requested_accounts,
         'per_account_count': per_account_count,
         'launch_plan': launch_plan,
+        'worker_roots': worker_roots,  # grouped 模式：各账号实际 root
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return path
 
 
-def start_monitor_process(root: Path, monitor_dir: Path) -> None:
-    monitor_json = monitor_dir / '发布监控.json'
-    bridge_script = str(Path(__file__).with_name('publish_pool_monitor_bridge.py'))
-    qt_script = str(Path(__file__).with_name('publish_live_monitor_qt.py'))
-    py = sys.executable
 
+def cleanup_worker_browser_processes(worker: str, debug_dir: Path, timeout_seconds: int = 8) -> dict:
+    """Best-effort cleanup for Edge processes that belong to one finished worker.
+
+    Playwright persistent contexts use profile dirs under this worker debug dir. If a
+    worker exits but msedge children are left behind, starting the next queued worker
+    would exceed the requested browser-window concurrency. Kill only msedge.exe
+    processes whose command line contains this worker's debug/profile path.
+    """
+    debug_text = str(debug_dir.resolve())
+    if not debug_text:
+        return {"worker": worker, "debug_dir": str(debug_dir), "matched": 0, "killed": 0, "errors": ["empty debug dir"]}
+    ps = """
+$needle = [Regex]::Escape($env:MILU_WORKER_DEBUG_DIR)
+$rows = Get-CimInstance Win32_Process -Filter "name = 'msedge.exe'" | Where-Object { $_.CommandLine -and ($_.CommandLine -match $needle) }
+$out = @()
+foreach ($p in $rows) {
+  $item = [ordered]@{ pid = [int]$p.ProcessId; commandLine = [string]$p.CommandLine; killed = $false; error = '' }
+  try {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+    $item.killed = $true
+  } catch {
+    $item.error = [string]$_.Exception.Message
+  }
+  $out += [pscustomobject]$item
+}
+$out | ConvertTo-Json -Compress
+"""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            text=True,
+            capture_output=True,
+            timeout=max(1, int(timeout_seconds)),
+            env={**os.environ, "MILU_WORKER_DEBUG_DIR": debug_text},
+        )
+        raw = (proc.stdout or "").strip()
+        rows = []
+        if raw:
+            payload = json.loads(raw)
+            rows = payload if isinstance(payload, list) else [payload]
+        errors = [str(x.get("error") or "") for x in rows if isinstance(x, dict) and x.get("error")]
+        if proc.returncode != 0:
+            errors.append((proc.stderr or "powershell cleanup failed")[:500])
+        return {
+            "worker": worker,
+            "debug_dir": debug_text,
+            "matched": len(rows),
+            "killed": len([x for x in rows if isinstance(x, dict) and x.get("killed")]),
+            "pids": [x.get("pid") for x in rows if isinstance(x, dict)],
+            "errors": errors,
+        }
+    except Exception as exc:
+        return {"worker": worker, "debug_dir": debug_text, "matched": 0, "killed": 0, "errors": [str(exc)[:500]]}
+
+def start_monitor_process(root: Path, monitor_dir: Path) -> None:
+    """启动监控：bridge 生成 JSON 数据 + Qt UI 显示窗口"""
+    import threading
+    import time
+
+    py = sys.executable
+    src_dir = str(Path(__file__).resolve().parent)
+
+    bridge_script = str(Path(__file__).with_name('publish_monitor_by_account.py'))
+    qt_script = str(Path(__file__).with_name('publish_monitor_account_qt.py'))
+
+    monitor_json = monitor_dir / 'monitor.json'
     bridge_cmd = [py, bridge_script, '--root', str(root), '--out-dir', str(monitor_dir), '--watch']
     qt_cmd = [py, qt_script, str(monitor_json)]
 
-    subprocess.Popen(bridge_cmd, cwd=str(Path(__file__).resolve().parent.parent), creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
-    subprocess.Popen(qt_cmd, cwd=str(Path(__file__).resolve().parent.parent), creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
+    def _launch():
+        try:
+            # 1. 先启动 bridge，写入 JSON 数据
+            bridge_proc = subprocess.Popen(
+                bridge_cmd, cwd=src_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            )
+            # 等 1.5 秒让 bridge 先生成第一份 JSON
+            time.sleep(1.5)
+            if bridge_proc.poll() is not None:
+                _, err = bridge_proc.communicate(timeout=1)
+                print(json.dumps({"monitor_error": "bridge exited", "stderr": (err or b'').decode(errors='ignore')[:300]}, ensure_ascii=False), file=sys.stderr)
+                return
+            print(json.dumps({"monitor_bridge": "started", "pid": bridge_proc.pid}, ensure_ascii=False))
+
+            # 2. 再启动 Qt UI 窗口
+            qt_proc = subprocess.Popen(
+                qt_cmd, cwd=src_dir,
+                creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            )
+            time.sleep(1)
+            if qt_proc.poll() is not None:
+                print(json.dumps({"monitor_error": "qt ui exited immediately", "pid": qt_proc.pid}, ensure_ascii=False), file=sys.stderr)
+            else:
+                print(json.dumps({"monitor_qt": "started", "pid": qt_proc.pid}, ensure_ascii=False))
+
+        except Exception as e:
+            print(json.dumps({"monitor_error": str(e)[:300]}, ensure_ascii=False), file=sys.stderr)
+
+    threading.Thread(target=_launch, daemon=True).start()
 
 
 def load_last_activity_name(root: Path) -> str:
@@ -434,6 +531,10 @@ def main() -> int:
 
     root_docx_before = count_root_docx(root)
     need_total = len(requested_accounts) * args.count
+    needed_by_root: dict[str, int] = {}
+    for item in worker_targets:
+        root_key = str(item['root'].resolve())
+        needed_by_root[root_key] = needed_by_root.get(root_key, 0) + int(args.count)
 
     ingest_summaries = []
     launch_plan = []
@@ -450,13 +551,18 @@ def main() -> int:
         todo_before = count_todo(worker_root)
         root_docx_before_this = count_root_docx(worker_root)
         ingest_limit = None
+        root_needed_total = int(needed_by_root.get(root_key, need_total) or 0)
         if root_docx_before_this > 0:
-            ingest_limit = max(root_docx_before_this, need_total)
+            # 只把本轮需要的数量移入待发布。旧逻辑会把根目录里的 docx 全部激活，
+            # 即使弹窗里只请求了一小轮任务。
+            remaining_needed = max(0, root_needed_total - todo_before)
+            ingest_limit = min(root_docx_before_this, remaining_needed) if remaining_needed > 0 else 0
 
         ingest_summary = {"count": 0, "moved": 0, "skipped": 0, "failed": 0, "rows": []}
         if ingest_limit and ingest_limit > 0:
             if args.dry_run:
-                preview = [str((worker_root / POOL_TODO_DIR / p.name)) for p in iter_root_docx(worker_root)]
+                preview_sources = list(iter_root_docx(worker_root))[:ingest_limit]
+                preview = [str((worker_root / POOL_TODO_DIR / p.name)) for p in preview_sources]
                 ingest_summary = {
                     "count": len(preview),
                     "moved": len(preview),
@@ -551,7 +657,8 @@ def main() -> int:
         shortage_path.write_text(f'计划发布 {need_total} 篇，当前待发布 {total_todo_after} 篇，缺少 {max(0, need_total - total_todo_after)} 篇。\n', encoding='utf-8')
     start_monitor_process(root, monitor_dir)
 
-    limit = max(1, int(args.concurrency or 0)) if int(args.concurrency or 0) > 0 else len(launch_plan)
+    requested_limit = max(1, int(args.concurrency or 0)) if int(args.concurrency or 0) > 0 else len(launch_plan)
+    limit = min(requested_limit, len(launch_plan)) if launch_plan else 0
     pending = list(launch_plan)
     running: list[dict] = []
     started: list[dict] = []
@@ -559,15 +666,25 @@ def main() -> int:
 
     def _launch_one(item: dict):
         proc = subprocess.Popen(item["command"], cwd=str(Path(__file__).resolve().parent.parent))
-        meta = {"worker": item["worker"], "pid": proc.pid, "command": item["command"], "proc": proc}
+        meta = {
+            "worker": item["worker"],
+            "pid": proc.pid,
+            "command": item["command"],
+            "proc": proc,
+            "debug_dir": item.get("debug_dir", ""),
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
         running.append(meta)
-        started.append({"worker": item["worker"], "pid": proc.pid, "command": item["command"]})
+        started.append({k: v for k, v in meta.items() if k != "proc"})
 
     def _write_queue_state():
         queue_path = monitor_dir / 'launch_queue.json'
         queue_path.write_text(json.dumps({
             'root': str(root),
+            'requested_concurrency': requested_limit,
             'concurrency': limit,
+            'active_slots': len(running),
+            'strict_note': 'A queued worker starts only after a running worker process exits and its own Edge/profile leftovers are cleaned.',
             'started': [{k: v for k, v in x.items() if k != 'proc'} for x in running],
             'pending': [{"worker": x['worker'], "command": x['command']} for x in pending],
             'finished': finished,
@@ -600,8 +717,11 @@ def main() -> int:
             if code is None:
                 running.append(meta)
                 continue
-            finished.append({"worker": meta['worker'], "pid": meta['pid'], "returncode": code})
+            cleanup = cleanup_worker_browser_processes(meta['worker'], Path(meta.get('debug_dir') or ''))
+            finished.append({"worker": meta['worker'], "pid": meta['pid'], "returncode": code, "browser_cleanup": cleanup})
             progressed = True
+            # 等 worker 进程退出并清理自己的 Edge/profile 残留后，再补下一个槽位；
+            # 同时尊重监控窗口写入的停止控制。
             while pending and len(running) < limit and _can_launch_more():
                 _launch_one(pending.pop(0))
         _write_queue_state()
